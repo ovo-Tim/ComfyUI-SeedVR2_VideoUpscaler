@@ -704,13 +704,16 @@ def _stream_video_chunks(
         # Remove context frames from output
         if context_count > 0:
             result = result[context_count:]
-        
-        # Save tail for next chunk context
+
+        # Save tail for next chunk context (delete old one first to free memory)
+        if prev_raw_tail is not None:
+            del prev_raw_tail
         prev_raw_tail = new_frames[-overlap:].clone() if overlap > 0 else None
-        
+
         # Cleanup before yield
         del frames
-        
+        del new_frames
+
         yield result
         
         # Memory cleanup between chunks
@@ -1080,10 +1083,19 @@ def _worker_process(
             total_chunks=total_chunks,
             log_prefix=f"[GPU {proc_idx}] "
         ):
-            results.append(result.cpu())
-        
+            cpu_result = result.cpu()
+            results.append(cpu_result)
+            del result  # Free GPU memory immediately after copying to CPU
+
         cap.release()
         result_tensor = torch.cat(results, dim=0) if results else torch.empty(0, dtype=torch.float32)
+
+        # Clear results list to free memory before sharing
+        del results
+        import gc
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
     
     # Pre-loaded frames mode (original behavior)
     else:
@@ -1239,13 +1251,13 @@ def _gpu_processing(
         p.join()
 
     # Concatenate results with overlap blending using shared function
-    if args.temporal_overlap > 0 and num_devices > 1:        
+    if args.temporal_overlap > 0 and num_devices > 1:
         overlap = args.temporal_overlap
         result_tensor = None
-        
+
         for idx, res_np in enumerate(results_np):
             chunk_tensor = torch.from_numpy(res_np).to(torch.float32)
-            
+
             if idx == 0:
                 # First chunk: keep all frames
                 result_tensor = chunk_tensor
@@ -1255,26 +1267,50 @@ def _gpu_processing(
                     # Get overlapping regions
                     prev_tail = result_tensor[-overlap:]  # Last N frames from accumulated result
                     cur_head = chunk_tensor[:overlap]      # First N frames from current chunk
-                    
+
                     # Blend using shared function
                     blended = blend_overlapping_frames(prev_tail, cur_head, overlap)
-                    
+
+                    # Create concatenated slices (store in variable to delete old result_tensor)
+                    old_result = result_tensor
+                    result_body = old_result[:-overlap]
+                    chunk_tail = chunk_tensor[overlap:]
+
                     # Replace tail of result with blended frames, then append rest of chunk
                     result_tensor = torch.cat([
-                        result_tensor[:-overlap],           # Everything except the tail
+                        result_body,                        # Everything except the tail
                         blended,                            # Blended overlapping frames
-                        chunk_tensor[overlap:]              # Non-overlapping part of current chunk
+                        chunk_tail                          # Non-overlapping part of current chunk
                     ], dim=0)
+
+                    # Explicitly delete intermediate tensors to free memory
+                    del prev_tail, cur_head, blended, old_result, result_body, chunk_tail
                 else:
                     # Edge case: chunk too small, just append non-overlapping part
                     if chunk_tensor.shape[0] > overlap:
-                        result_tensor = torch.cat([result_tensor, chunk_tensor[overlap:]], dim=0)
-        
+                        old_result = result_tensor
+                        result_tensor = torch.cat([old_result, chunk_tensor[overlap:]], dim=0)
+                        del old_result
+
+                # Delete chunk tensor after processing
+                del chunk_tensor
+
         if result_tensor is None:
             result_tensor = torch.from_numpy(results_np[0]).to(torch.float32)
+
+        # Force garbage collection after all blending operations
+        import gc
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
     else:
         # Simple concatenation without overlap
         result_tensor = torch.from_numpy(np.concatenate(results_np, axis=0)).to(torch.float32)
+
+    # Free numpy arrays from workers after conversion
+    del results_np
+    import gc
+    gc.collect()
 
     # Handle prepend_frames removal (multi-GPU safe - done after all workers complete)
     if args.prepend_frames > 0:
