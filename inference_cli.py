@@ -131,7 +131,7 @@ from src.core.generation_phases import (
     postprocess_all_batches
 )
 from src.utils.debug import Debug
-from src.optimization.memory_manager import clear_memory, get_gpu_backend, is_cuda_available
+from src.optimization.memory_manager import clear_memory, get_gpu_backend, is_cuda_available, release_tensor_collection
 debug = Debug(enabled=False)  # Will be enabled via --debug CLI flag
 
 
@@ -870,10 +870,16 @@ def _process_frames_core(
     if runner_cache is not None and 'ctx' in runner_cache:
         ctx = runner_cache['ctx']
         # Clear previous run data but keep device config
-        keys_to_keep = {'dit_device', 'vae_device', 'dit_offload_device', 
+        keys_to_keep = {'dit_device', 'vae_device', 'dit_offload_device',
                        'vae_offload_device', 'tensor_offload_device', 'compute_dtype'}
+        # Keys containing tensors that need explicit memory release
+        tensor_keys = {'input_images', 'final_video', 'all_latents', 'all_upscaled_latents',
+                      'all_decoded', 'all_alpha_channels', 'all_input_rgb', 'batch_metadata'}
         for key in list(ctx.keys()):
             if key not in keys_to_keep:
+                # Release tensor memory before removing reference
+                if key in tensor_keys:
+                    release_tensor_collection(ctx[key])
                 del ctx[key]
     else:
         ctx = setup_generation_context(
@@ -1092,6 +1098,33 @@ def _worker_process(
 
         # Clear results list to free memory before sharing
         del results
+
+        # Release cached models and context to free memory before sharing
+        # This is critical for long videos where workers hold models in RAM
+        if runner_cache is not None:
+            # Release context tensors
+            if 'ctx' in runner_cache:
+                ctx = runner_cache['ctx']
+                tensor_keys = {'input_images', 'final_video', 'all_latents', 'all_upscaled_latents',
+                              'all_decoded', 'all_alpha_channels', 'all_input_rgb'}
+                for key in tensor_keys:
+                    if key in ctx:
+                        release_tensor_collection(ctx[key])
+            # Release cached runner/models
+            if 'runner' in runner_cache:
+                runner = runner_cache['runner']
+                if hasattr(runner, 'dit') and runner.dit is not None:
+                    for param in runner.dit.parameters():
+                        if param.numel() > 0:
+                            param.data.set_()
+                    runner.dit = None
+                if hasattr(runner, 'vae') and runner.vae is not None:
+                    for param in runner.vae.parameters():
+                        if param.numel() > 0:
+                            param.data.set_()
+                    runner.vae = None
+            runner_cache.clear()
+
         import gc
         gc.collect()
         if torch.cuda.is_available():
@@ -1703,6 +1736,14 @@ def main() -> None:
                         )
                         args.cache_dit = False
                         args.cache_vae = False
+                    else:
+                        # Multi-GPU streaming with caching: each worker keeps its own model copies
+                        # This multiplies memory usage by number of GPUs
+                        debug.log(
+                            f"Multi-GPU streaming with model caching: each of {len(device_list)} workers will cache models. "
+                            f"For very long videos, consider disabling --cache_dit/--cache_vae to reduce RAM usage.",
+                            category="tip", force=True
+                        )
                 elif streaming:
                     runner_cache = {}
                 else:
