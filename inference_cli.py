@@ -49,6 +49,7 @@ import os
 import argparse
 import time
 import platform
+import threading
 import multiprocessing as mp
 from typing import Dict, Any, List, Optional, Tuple, Literal, Generator
 from datetime import datetime
@@ -142,11 +143,11 @@ debug = Debug(enabled=False)  # Will be enabled via --debug CLI flag
 class FFMPEGVideoWriter:
     """
     Video writer using ffmpeg subprocess for encoding with 10-bit support.
-    
+
     Provides cv2.VideoWriter-compatible interface (write, isOpened, release) while
     using ffmpeg for encoding. Enables 10-bit output (yuv420p10le with x265) which
     reduces banding artifacts in gradients compared to 8-bit opencv output.
-    
+
     Args:
         path: Output video file path
         width: Frame width in pixels
@@ -154,59 +155,137 @@ class FFMPEGVideoWriter:
         fps: Frames per second
         use_10bit: If True, uses x265 codec with yuv420p10le pixel format.
                    If False, uses x264 with yuv420p (default: False)
-    
+
     Raises:
         RuntimeError: If ffmpeg is not found in system PATH
-    
+
     Note:
         Frames must be passed to write() in BGR format (same as cv2.VideoWriter).
         Internally converts to RGB for ffmpeg rawvideo input.
     """
-    
+
+    # Timeout (seconds) for ffmpeg to finalize encoding after stdin is closed.
+    # x265 flush can be slow on large videos, so this is generous.
+    WAIT_TIMEOUT = 120
+    TERMINATE_TIMEOUT = 15
+
     def __init__(self, path: str, width: int, height: int, fps: float, use_10bit: bool = False):
         pix_fmt = 'yuv420p10le' if use_10bit else 'yuv420p'
         codec = 'libx265' if use_10bit else 'libx264'
-        
+
         self.proc = subprocess.Popen(
-            ['ffmpeg', '-y', '-f', 'rawvideo', '-pix_fmt', 'rgb24',
+            ['ffmpeg', '-y', '-loglevel', 'warning',
+             '-f', 'rawvideo', '-pix_fmt', 'rgb24',
              '-s', f'{width}x{height}', '-r', str(fps), '-i', '-',
              '-c:v', codec, '-pix_fmt', pix_fmt, '-preset', 'medium', '-crf', '12', path],
-            stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE
         )
-    
+        # Drain stderr in a background thread to prevent pipe buffer filling up
+        # and blocking ffmpeg. Only warnings/errors are emitted (-loglevel warning).
+        self._stderr_lines: list = []
+        self._stderr_thread = threading.Thread(target=self._drain_stderr, daemon=True)
+        self._stderr_thread.start()
+
+    def _drain_stderr(self):
+        """Read stderr in background to prevent pipe deadlock."""
+        try:
+            for line in self.proc.stderr:
+                self._stderr_lines.append(line)
+                # Keep only last 50 lines to limit memory usage
+                if len(self._stderr_lines) > 50:
+                    self._stderr_lines = self._stderr_lines[-50:]
+        except (ValueError, OSError):
+            pass  # Pipe closed or process exited
+
     def write(self, frame_bgr: np.ndarray):
         if not self.isOpened():
-            raise RuntimeError("FFMPEGVideoWriter: ffmpeg process is not running")
-        
+            stderr_hint = self._get_stderr_summary()
+            raise RuntimeError(
+                f"FFMPEGVideoWriter: ffmpeg process is not running.{stderr_hint}"
+            )
+
         frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
         try:
             self.proc.stdin.write(frame_rgb.astype(np.uint8).tobytes())
             self.proc.stdin.flush()  # Critical: prevent buffering issues
         except BrokenPipeError:
+            stderr_hint = self._get_stderr_summary()
             raise RuntimeError(
                 "FFMPEGVideoWriter: ffmpeg process terminated unexpectedly. "
-                "Check video path, codec support, and disk space."
+                f"Check video path, codec support, and disk space.{stderr_hint}"
             )
-    
+
     def isOpened(self) -> bool:
         return self.proc is not None and self.proc.poll() is None
-    
+
     def release(self):
-        if self.proc:
+        if self.proc is None:
+            return
+
+        # Close stdin to signal EOF to ffmpeg
+        try:
+            self.proc.stdin.close()
+        except Exception:
+            pass
+
+        # Wait for ffmpeg to finalize encoding with a timeout
+        try:
+            self.proc.wait(timeout=self.WAIT_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            debug.log(
+                f"ffmpeg did not exit within {self.WAIT_TIMEOUT}s after closing input, sending SIGTERM",
+                level="WARNING", force=True, category="file"
+            )
+            self.proc.terminate()
+            try:
+                self.proc.wait(timeout=self.TERMINATE_TIMEOUT)
+            except subprocess.TimeoutExpired:
+                debug.log(
+                    "ffmpeg did not respond to SIGTERM, sending SIGKILL",
+                    level="WARNING", force=True, category="file"
+                )
+                self.proc.kill()
+                self.proc.wait()
+
+        # Wait for stderr thread to finish
+        self._stderr_thread.join(timeout=5)
+
+        if self.proc.returncode != 0:
+            stderr_hint = self._get_stderr_summary()
+            debug.log(
+                f"ffmpeg exited with code {self.proc.returncode}. "
+                f"Check output file for corruption.{stderr_hint}",
+                level="WARNING", force=True, category="file"
+            )
+        self.proc = None
+
+    def _get_stderr_summary(self) -> str:
+        """Return last stderr lines from ffmpeg for diagnostics."""
+        if not self._stderr_lines:
+            return ""
+        try:
+            text = b"".join(self._stderr_lines).decode("utf-8", errors="replace").strip()
+            if text:
+                return f"\nffmpeg stderr: {text[-500:]}"
+        except Exception:
+            pass
+        return ""
+
+    def __del__(self):
+        """Safety net: ensure ffmpeg process is cleaned up on garbage collection."""
+        if getattr(self, 'proc', None) is not None and self.proc.poll() is None:
             try:
                 self.proc.stdin.close()
             except Exception:
-                pass  # Ignore errors on close
-            
-            self.proc.wait()
-            
-            if self.proc.returncode != 0:
-                debug.log(
-                    f"ffmpeg exited with code {self.proc.returncode}. "
-                    "Check output file for corruption.",
-                    level="WARNING", force=True, category="file"
-                )
-            self.proc = None
+                pass
+            try:
+                self.proc.terminate()
+                self.proc.wait(timeout=5)
+            except Exception:
+                try:
+                    self.proc.kill()
+                except Exception:
+                    pass
 
 
 # =============================================================================
